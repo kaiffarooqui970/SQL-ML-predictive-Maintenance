@@ -1,151 +1,101 @@
 """
 QuantShield — FastAPI entry point & router
-Handles request validation, calls the simulation engine, and returns results.
 """
 
 from __future__ import annotations
-
 import logging
+import os
+import io
+import base64
+import requests
+import uvicorn
 from contextlib import asynccontextmanager
 
-import uvicorn
+import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse 
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from typing import optional, Dict
+from typing import Optional, Dict
+from jinja2 import Template
+from xhtml2pdf import pisa 
+
 from engine import SimulationResult, run_simulation
 
 # ---------------------------------------------------------------------------
-# Logging
+# API Key Setup
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s — %(message)s",
-)
+# 1. Log into https://aistudio.google.com/app/apikey -> Copy the AIza... key
+# 2. Log into https://elevenlabs.io/app/settings -> Copy your API Key
+GEMINI_API_KEY = "PASTE_YOUR_AIza_GEMINI_KEY_HERE"
+ELEVENLABS_API_KEY = "PASTE_YOUR_ELEVENLABS_KEY_HERE"
+
+# Configure SDKs
+os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ---------------------------------------------------------------------------
+# Logging & Lifespan
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s — %(message)s")
 logger = logging.getLogger("quantshield")
 
-
-# ---------------------------------------------------------------------------
-# Lifespan (startup / shutdown hooks)
-# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("QuantShield API starting up…")
     yield
     logger.info("QuantShield API shutting down.")
 
+# ---------------------------------------------------------------------------
+# App & Middleware
+# ---------------------------------------------------------------------------
+app = FastAPI(title="QuantShield Risk API", version="1.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ---------------------------------------------------------------------------
-# App
+# Models
 # ---------------------------------------------------------------------------
-app = FastAPI(
-    title="QuantShield Risk API",
-    version="1.0.0",
-    description="Monte Carlo portfolio risk simulation engine.",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # Tighten to your frontend origin in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional, Dict # Ensure these are imported!
-
 class SimulationRequest(BaseModel):
-    """Payload sent by the React frontend."""
-
-    tickers: list[str] = Field(
-        ...,
-        min_length=1,
-        max_length=20,
-        description="List of ticker symbols (e.g. ['AAPL', 'MSFT']).",
-        examples=[["AAPL", "MSFT", "NVDA"]],
-    )
-    days: int = Field(
-        default=252,
-        ge=1,
-        le=1260,
-        description="Number of forward-projection days (1–1260).",
-        examples=[252],
-    )
-    # --- NEW: Added weights field ---
-    weights: Optional[Dict[str, float]] = Field(
-        default=None,
-        description="Dictionary mapping ticker symbols to custom weight percentages (decimals summing to 1.0).",
-        examples=[{"AAPL": 0.6, "MSFT": 0.4}],
-    )
-
+    tickers: list[str]; days: int = 252; weights: Optional[Dict[str, float]] = None
     @field_validator("tickers")
     @classmethod
-    def normalise_tickers(cls, v: list[str]) -> list[str]:
-        cleaned = [t.strip().upper() for t in v]
-        if len(cleaned) != len(set(cleaned)):
-            raise ValueError("Duplicate tickers are not allowed.")
-        return cleaned
+    def normalise_tickers(cls, v):
+        return [t.strip().upper() for t in v]
+
+class ReportData(BaseModel):
+    firm_name: str; client_name: str; tickers: list[str]; weights: list[float]; expected_return: float; value_at_risk: float; max_drawdown: float
+
+class AdvisorRequest(BaseModel):
+    user_message: str; tickers: list[str]; weights: list[float]; expected_return: float; max_drawdown: float
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-@app.post(
-    "/api/simulate",
-    response_model=SimulationResponse,
-    tags=["simulation"],
-    summary="Run a Monte Carlo portfolio risk simulation.",
-)
-async def simulate(request: SimulationRequest) -> SimulationResponse:
-    """
-    Fetches 2 years of daily adjusted-close data for the requested tickers,
-    builds a custom-weighted portfolio, runs ≥ 1,000 GBM paths, and returns
-    key risk metrics.
-    """
-    logger.info(
-        "Simulation request received — tickers=%s, days=%d, weights=%s",
-        request.tickers,
-        request.days,
-        request.weights, # Added logging so you can see it in the terminal!
-    )
+@app.post("/api/simulate")
+async def simulate(request: SimulationRequest):
+    result = run_simulation(tickers=request.tickers, projection_days=request.days, weights=request.weights)
+    return {"expected_return": round(result.expected_return, 6), "max_drawdown": round(result.max_drawdown, 6), "sharpe_ratio": round(result.sharpe_ratio, 4), "var_95": round(result.var_95, 2), "var_99": round(result.var_99, 2), "cvar": round(result.cvar, 2)}
 
+@app.post("/api/advisor")
+async def get_quant_advice(req: AdvisorRequest):
     try:
-        result: SimulationResult = run_simulation(
-            tickers=request.tickers,
-            projection_days=request.days,
-            weights=request.weights,  # <--- THIS IS THE MAGIC LINE
-        )
-    except ValueError as exc:
-        # Business-logic errors (bad ticker, insufficient history, etc.)
-        logger.warning("Simulation failed with ValueError: %s", exc)
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Unexpected error during simulation.")
-        raise HTTPException(status_code=500, detail="Internal simulation error.") from exc
+        portfolio_context = f"You are the QuantShield AI Advisor. User asks: {req.user_message}. Portfolio: {req.tickers}, Exp Return: {req.expected_return*100:.1f}%, Max Drawdown: {req.max_drawdown*100:.1f}%."
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(portfolio_context)
+        ai_text_reply = response.text.replace('*', '')
 
-    logger.info(
-        "Simulation complete — E[r]=%.4f  Sharpe=%.2f  VaR95=$%.2f",
-        result.expected_return,
-        result.sharpe_ratio,
-        result.var_95,
-    )
+        audio_base64 = None
+        try:
+            tts_response = requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM", 
+                json={"text": ai_text_reply, "model_id": "eleven_monolingual_v1"},
+                headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"})
+            if tts_response.ok: audio_base64 = base64.b64encode(tts_response.content).decode('utf-8')
+        except Exception as e: logger.error(f"TTS Failed: {e}")
 
-    return SimulationResponse(
-        expected_return=round(result.expected_return, 6),
-        max_drawdown=round(result.max_drawdown, 6),
-        sharpe_ratio=round(result.sharpe_ratio, 4),
-        var_95=round(result.var_95, 2),
-        var_99=round(result.var_99, 2),
-        cvar=round(result.cvar, 2),
-    )
+        return {"text": ai_text_reply, "audio_base64": audio_base64}
+    except Exception as e:
+        logger.exception("AI Failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ---------------------------------------------------------------------------
-# Dev entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

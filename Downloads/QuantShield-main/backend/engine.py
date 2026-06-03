@@ -19,7 +19,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional , Dict
 
 import numpy as np
 import pandas as pd
@@ -320,20 +320,31 @@ def fetch_adjusted_close(
 # ---------------------------------------------------------------------------
 # Step 2 — Portfolio returns
 # ---------------------------------------------------------------------------
-def build_portfolio_returns(prices: pd.DataFrame) -> np.ndarray:
+def build_portfolio_returns(prices: pd.DataFrame, weights: Optional[Dict[str, float]] = None) -> np.ndarray:
     """
-    Compute daily equal-weight portfolio log-returns.
-    Returns np.ndarray of shape (T-1,).
+    Compute daily portfolio log-returns. 
+    Uses custom weights if provided, otherwise defaults to equal-weight.
     """
     n_assets = len(prices.columns)
-    weights = np.full(n_assets, 1.0 / n_assets)
+    
+    # NEW LOGIC: Check if custom weights were passed in from the frontend
+    if weights is not None:
+        # Create an array of weights in the exact same order as the price columns
+        weights_array = np.array([weights.get(ticker, 0.0) for ticker in prices.columns])
+        # Normalize just to be perfectly safe against floating point rounding errors
+        weights_array = weights_array / np.sum(weights_array)
+    else:
+        # OLD LOGIC: Fallback to equal weights
+        weights_array = np.full(n_assets, 1.0 / n_assets)
 
     simple_returns = prices.pct_change().dropna()
-    portfolio_simple = simple_returns.values @ weights
+    
+    # Multiply the returns by our new dynamic weights_array
+    portfolio_simple = simple_returns.values @ weights_array
     log_returns = np.log1p(portfolio_simple)
 
     logger.info(
-        "Portfolio returns — n=%d, µ_daily=%.6f, σ_daily=%.6f",
+        "Portfolio returns — n=%d, μ_daily=%.6f, σ_daily=%.6f",
         len(log_returns),
         float(np.mean(log_returns)),
         float(np.std(log_returns, ddof=1)),
@@ -439,7 +450,7 @@ def run_simulation(
     prices = fetch_adjusted_close(tickers)
     
     # <--- NEW: Pass the weights into the math calculator
-    log_returns = build_portfolio_returns(prices, weights_dict=weights) 
+    log_returns = build_portfolio_returns(prices, weights=weights)
     
     paths = run_gbm_simulation(
         log_returns=log_returns,
